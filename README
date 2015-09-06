@@ -1,0 +1,55 @@
+# Warning
+This is a poc, most this (e.g. batch/push notifications/replace dot with underscore as name convention) are not implemented.
+
+# Basic design:
+Copied the net/rpc implementation from the std lib and removed some of the restrictions such as having 2 arguments
+and always returning an error. If we would like to provide this API as a lib for embedding this will allow for some more
+"go'isch" like interface instead of foring the design from the std lib.
+
+I needed to copy the net/rpc/jsonrpc package as well since it uses some of the types in the net/rpc direct. And since I
+copied and changed them this gives a conflict when the jsonrpc package from the std lib is used.
+
+You can test it with netcat or some other unix socket utility, e.g.:
+
+echo '{"jsonrpc":"2.0","method":"chainmanager.LatestBlockNumber","params":[], "id":1}' | nc -U /tmp/test.sock -q 1 | jq .
+echo '{"jsonrpc":"2.0","method":"chainmanager.EchoWithError","params":[1,2,"a","b"], "id":2}{"jsonrpc":"2.0","method":"chainmanager.Echo","params":[1,2,"a","b"], "id":1}' | nc -U /tmp/test.sock -q 1  | jq .
+
+
+# Issues:
+
+reflect package doesn't allow for variable name retrieval, e.g. with a method signature like:
+
+func (r SomeType) Foo(a, b int) (c, d int)
+
+It cannot create create a response object as:
+
+{
+	...
+	Result: {
+		a: 1,
+		b: 2
+	}
+}
+
+Solution:
+
+Functions which return a single value, e.g. latest block number will return just the value
+{"id":1,"result":392398}
+
+Multi return values a grouped within a structure:
+type Ret struct {A, B int}
+func (r SomeType) Foo(a, b int) Ret
+
+Serialize it as a map which will give key value pairs (field names can be retrieved with the reflect package)
+
+Currently I use the "github.com/fatih/structs" pkg:
+
+	var res interface{}
+	if isStruct {
+		res = structs.Map(returnValues[retStructIdx].Interface())
+	} else {
+		res = returnValues[0].Interface()
+	}
+
+	server.sendResponse(sending, req, res, codec, "")
+
