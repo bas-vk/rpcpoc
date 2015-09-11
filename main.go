@@ -1,73 +1,33 @@
 package main
 
 import (
-	"fmt"
-	"math/big"
 	"net"
 
 	"time"
 
 	"github.com/bas-vk/rpcpoc/rpc"
 	"github.com/bas-vk/rpcpoc/rpc/jsonrpc"
+	"golang.org/x/net/context"
 )
 
-// representation of core.ChainManager
-type ChainManager struct {
+type DummyRpcService struct {
 }
 
-func (cm *ChainManager) SomeNonExposedMethod() uint64 {
-	return 123456
+func (s *DummyRpcService) Hello() string {
+	return "hi"
 }
 
-func (cm *ChainManager) LatestBlockNumber() BlockNumber {
-	return NewBlockNumber(392398)
+type EchoArgs struct {
+	Input string `json:"input"`
+	IntInput int `json:"inputi"`
 }
 
-func (cm *ChainManager) GetBlock(number BlockNumber) (*Block, error) {
-	return &Block{
-		Number:   number,
-		Hash:     "0x9392392323232",
-		GasLimit: big.NewInt(39293932),
-		GasUsed:  big.NewInt(39823923932),
-		Nonce:    3023992332,
-	}, nil
+func (s *DummyRpcService) Echo(args EchoArgs) string {
+	return args.Input
 }
 
-// Proxy objects will wrap the core types and exposes the RPC methods.
-type ChainManagerProxy struct {
-	cm *ChainManager // the proxy would call methods on this instance
-}
-
-func (p *ChainManagerProxy) LatestBlockNumber() (BlockNumber, error) {
-	return p.cm.LatestBlockNumber(), nil
-}
-
-func (p *ChainManagerProxy) GetBlockByNumber(number BlockNumber) (*Block, error) {
-	return p.cm.GetBlock(number)
-}
-
-type unexportedType struct{}
-
-func (p *ChainManagerProxy) SkipMethod(val unexportedType) {
-}
-
-type EchoResponse struct {
-	A    int
-	B    *int
-	Str1 string
-	Str2 *string
-}
-
-func (p *ChainManagerProxy) Echo(a int, b *int, str1 string, str2 *string) EchoResponse {
-	return EchoResponse{a, b, str1, str2}
-}
-
-func (p *ChainManagerProxy) EchoWithError(a int, b *int, str1 string, str2 *string) (int, *int, string, *string, error) {
-	return a, b, str1, str2, fmt.Errorf("error %d/%d/%s/%s", a, *b, str1, *str2)
-}
-
-func (p *ChainManagerProxy) GasPrice() GasValue {
-	return big.NewInt(39293)
+func (s *DummyRpcService) EchoWithContext(ctx context.Context, args EchoArgs) string {
+	return args.Input
 }
 
 func startUnixServer() {
@@ -77,8 +37,8 @@ func startUnixServer() {
 	}
 
 	svr := rpc.NewServer()
-	cm := new(ChainManagerProxy)
-	svr.RegisterName("chainmanager", cm)
+	cm := new(DummyRpcService)
+	svr.RegisterName("service", cm)
 
 	go func() {
 		for {

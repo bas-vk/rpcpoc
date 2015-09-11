@@ -53,3 +53,9 @@ Currently I use the "github.com/fatih/structs" pkg:
 
 	server.sendResponse(sending, req, res, codec, "")
 
+
+
+
+# Optional arguments
+The RPC interface supports named as well positional arguments. Optional arguments are full supported when using named
+arguments. Optional argument in combination with positional arguments are only support at the end.

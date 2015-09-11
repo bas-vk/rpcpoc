@@ -137,6 +137,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/fatih/structs"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -149,20 +150,21 @@ const (
 // because Typeof takes an empty interface value.  This is annoying.
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
-type methodType struct {
+type handlerType struct {
 	sync.Mutex                // protects counters
 	method     reflect.Method // callback
-	ArgTypes   []reflect.Type // collection with input argument types
-	ReplyTypes []reflect.Type // collection with the return types
+	ArgType    reflect.Type   // input argument type
+	ReplyType  reflect.Type   // return type
 	CanRetErr  bool           // indication if the method can return an error
 	numCalls   uint           // number of times called
+	hasCtxArgs bool           // indication if this handler expects a context
 }
 
 type service struct {
-	name   string                 // name of service
-	rcvr   reflect.Value          // receiver of methods for the service
-	typ    reflect.Type           // type of the receiver
-	method map[string]*methodType // registered methods
+	name   string                  // name of service
+	rcvr   reflect.Value           // receiver of methods for the service
+	typ    reflect.Type            // type of the receiver
+	method map[string]*handlerType // registered handlers
 }
 
 // Request is a header written before every RPC call.  It is used internally
@@ -208,6 +210,8 @@ func isExported(name string) bool {
 	return unicode.IsUpper(rune)
 }
 
+var rootContext = context.Background()
+
 // Is this type exported or a builtin?
 func isExportedOrBuiltinType(t reflect.Type) bool {
 	for t.Kind() == reflect.Ptr {
@@ -216,6 +220,26 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 	// PkgPath will be non-empty even for an exported type,
 	// so we need to check the type name as well.
 	return isExported(t.Name()) || t.PkgPath() == ""
+}
+
+var contextType = reflect.TypeOf((*context.Context)(nil)).Elem()
+
+// Implements this type the net.Context interface?
+// (https://godoc.org/golang.org/x/net/context)
+func isContextType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Implements(contextType)
+}
+
+var errorType = reflect.TypeOf((*error)(nil)).Elem()
+// Implements this type the error interface
+func isErrorType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Implements(errorType)
 }
 
 // Register publishes in the server the set of methods of the
@@ -289,9 +313,9 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 
 // suitableMethods returns suitable Rpc methods of typ, it will report
 // error using log if reportErr is true.
-func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
-	methods := make(map[string]*methodType)
-OUTER:
+func suitableMethods(typ reflect.Type, reportErr bool) map[string]*handlerType {
+	methods := make(map[string]*handlerType)
+//OUTER:
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
 		mtype := method.Type
@@ -300,53 +324,78 @@ OUTER:
 		if method.PkgPath != "" {
 			continue
 		}
-		// Method needs at least one ins: receiver
-		if mtype.NumIn() < 1 {
+
+		// Method can have 0, 1 (context or args) or 2 (context and args) arguments
+		numIn := mtype.NumIn() - 1 // first is receiver
+		if numIn > 2 {
 			if reportErr {
 				log.Println("method", mname, "has wrong number of ins:", mtype.NumIn())
 			}
 			continue
 		}
 
-		// check if all args are exported or built in types
-		argTypes := make([]reflect.Type, mtype.NumIn()-1)
-		for i := 1; i < mtype.NumIn(); i++ { // first is the receiver which we don't need
-			if !isExportedOrBuiltinType(mtype.In(i)) {
+		var handler handlerType
+		handler.method = method
+		if numIn >= 1 {
+			argType := mtype.In(1)
+			if isContextType(argType) {
+				handler.hasCtxArgs = true
+			} else if !isExportedOrBuiltinType(argType) {
 				if reportErr {
-					log.Printf("%s argument %d not an exported type - %v\n", mname, i, mtype.In(i))
+					log.Println(mname, "argument type not exported:", argType)
 				}
-				continue
-			}
-
-			argTypes[i-1] = mtype.In(i)
-		}
-
-		// check if all return values are exported or built in types
-		var hasError bool
-		outTypes := make([]reflect.Type, mtype.NumOut())
-		for i := 0; i < mtype.NumOut(); i++ {
-			if mtype.Out(i) == typeOfError {
-				if hasError { // verify if there is only a single error returned
-					if reportErr {
-						log.Printf("%s returns multiple errors\n", mname)
-						continue OUTER
-					}
-				}
-				hasError = true
-				outTypes[i] = mtype.Out(i)
-			} else if isExportedOrBuiltinType(mtype.Out(i)) {
-				outTypes[i] = mtype.Out(i)
 				continue
 			} else {
-				if reportErr {
-					log.Printf("Returned argument #%d for %s is of invalid type %v\n", i, mname, mtype.Out(i))
-				}
-				continue OUTER
+				handler.ArgType = argType
 			}
 		}
 
-		methods[mname] = &methodType{method: method, ArgTypes: argTypes, ReplyTypes: outTypes, CanRetErr: hasError}
+		if numIn >= 2 {
+			argType := mtype.In(2)
+			if isContextType(argType) {
+				if reportErr {
+					log.Println(mname, "context must be the first argument")
+				}
+				continue
+			}
+			handler.ArgType = argType
+		}
+
+		numOut := mtype.NumOut()
+		if numOut >= 1 {
+			replyType := mtype.Out(0)
+			if isErrorType(replyType) {
+				if numOut > 1 {
+					if reportErr {
+						log.Println(mname, "error must be the last returned value")
+					}
+					continue
+				}
+				handler.CanRetErr = true
+			} else if isExportedOrBuiltinType(replyType) {
+				handler.ReplyType = replyType
+			} else {
+				if reportErr {
+					log.Printf("First returned value for %s is of invalid type\n", mname)
+				}
+			}
+		}
+
+		if numOut >= 2 {
+			replyType := mtype.Out(1)
+			if isErrorType(replyType) {
+				handler.CanRetErr = true
+			} else {
+				if reportErr {
+					log.Printf("Last returned value for %s must be an error %v\n", mname)
+				}
+				continue
+			}
+		}
+
+		methods[mname] = &handler
 	}
+
 	return methods
 }
 
@@ -373,26 +422,38 @@ func (server *Server) sendResponse(sending *sync.Mutex, req *Request, reply inte
 	server.freeResponse(resp)
 }
 
-func (m *methodType) NumCalls() (n uint) {
+func (m *handlerType) NumCalls() (n uint) {
 	m.Lock()
 	n = m.numCalls
 	m.Unlock()
 	return n
 }
 
-func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv []reflect.Value, codec ServerCodec) {
+func (s *service) call(server *Server, sending *sync.Mutex, mtype *handlerType, req *Request, argv, replyv reflect.Value, codec ServerCodec) {
 	mtype.Lock()
 	mtype.numCalls++
 	mtype.Unlock()
 	function := mtype.method.Func
 
 	// Invoke the method, providing a new value for the reply.
-	args := make([]reflect.Value, 0)
-	args = append(args, s.rcvr)
-	args = append(args, argv...)
-	returnValues := function.Call(args)
+	returnValues := function.Call([]reflect.Value{s.rcvr, argv})
 
-	// look if their an error in the return types and return it if its not nil
+	// look if their is an error in the return types (last returnValue) and return it if its not nil
+	if len(returnValues) > 0 {
+		if e, ok := returnValues[len(returnValues)-1].Interface().(error); ok {
+			server.sendResponse(sending, req, nil, codec, e.Error())
+			return
+		}
+	}
+
+	// call successful, return result (if any)
+	if len(returnValues) > 0 {
+		server.sendResponse(sending, req, returnValues[0].Interface(), codec, "")
+		return
+	}
+
+	server.sendResponse(sending,req, nil, codec, "")
+
 	var isStruct bool
 	var retStructIdx int
 	for i, retVal := range returnValues {
@@ -564,7 +625,8 @@ func (server *Server) freeResponse(resp *Response) {
 	server.respLock.Unlock()
 }
 
-func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *methodType, req *Request, argv, replyv []reflect.Value, keepReading bool, err error) {
+func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *handlerType, req *Request,
+	argv, replyv reflect.Value, keepReading bool, err error) {
 	service, mtype, req, keepReading, err = server.readRequestHeader(codec)
 	if err != nil {
 		if !keepReading {
@@ -576,35 +638,44 @@ func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *m
 	}
 
 	// Decode the params.
-	nArgs := len(mtype.ArgTypes)
-	argv = make([]reflect.Value, nArgs)
-	args := make([]interface{}, nArgs)
-	isptrs := make([]bool, nArgs)
-
-	for i := 0; i < nArgs; i++ {
-		typ := mtype.ArgTypes[i]
-		if typ.Kind() == reflect.Ptr {
-			typ = typ.Elem()
-			isptrs[i] = true
-		}
-		argv[i] = reflect.New(typ)
-		args[i] = argv[i].Interface()
-	}
-
-	if err = codec.ReadRequestBody(&args); err != nil {
+	argv = reflect.New(mtype.ArgType)
+	if err = codec.ReadRequestBody(argv.Interface()); err != nil {
 		return
 	}
 
-	for i := 0; i < nArgs; i++ {
-		if !isptrs[i] {
-			argv[i] = argv[i].Elem() // convert back to value from ptr
-		}
+	if mtype.ArgType.Kind() != reflect.Ptr {
+		argv = argv.Elem()
 	}
+
+//	nArgs := len(mtype.ArgTypes)
+//	argv = make([]reflect.Value, nArgs)
+//	args := make([]interface{}, nArgs)
+//	isptrs := make([]bool, nArgs)
+//
+//	for i := 0; i < nArgs; i++ {
+//		typ := mtype.ArgTypes[i]
+//		if typ.Kind() == reflect.Ptr {
+//			typ = typ.Elem()
+//			isptrs[i] = true
+//		}
+//		argv[i] = reflect.New(typ)
+//		args[i] = argv[i].Interface()
+//	}
+//
+//	if err = codec.ReadRequestBody(&args); err != nil {
+//		return
+//	}
+//
+//	for i := 0; i < nArgs; i++ {
+//		if !isptrs[i] {
+//			argv[i] = argv[i].Elem() // convert back to value from ptr
+//		}
+//	}
 
 	return
 }
 
-func (server *Server) readRequestHeader(codec ServerCodec) (service *service, mtype *methodType, req *Request, keepReading bool, err error) {
+func (server *Server) readRequestHeader(codec ServerCodec) (service *service, mtype *handlerType, req *Request, keepReading bool, err error) {
 	// Grab the request header.
 	req = server.getRequest()
 	err = codec.ReadRequestHeader(req)

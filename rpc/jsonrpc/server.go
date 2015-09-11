@@ -10,6 +10,9 @@ import (
 	"io"
 	"sync"
 
+	"fmt"
+	"reflect"
+
 	"github.com/bas-vk/rpcpoc/rpc"
 )
 
@@ -94,7 +97,65 @@ func (c *serverCodec) ReadRequestBody(x interface{}) error {
 		return errMissingParams
 	}
 
+	// JSON-RPC supports positional as well named arguments
+	// http://www.jsonrpc.org/specification#parameter_structures
+	if (*c.req.Params)[0] == '[' {
+		return c.positionalArgs(x)
+	}
+
+	// named arguments
 	return json.Unmarshal(*c.req.Params, &x)
+}
+
+func (c *serverCodec) positionalArgs(x interface{}) error {
+	val := reflect.ValueOf(x)
+	for val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+
+	args := make([]interface{}, val.NumField())
+
+	for i := 0; i < val.NumField(); i++ {
+		args[i] = val.Field(i).Interface()
+	}
+
+	return json.Unmarshal(*c.req.Params, &args)
+
+//	t := reflect.TypeOf(x)
+//	for t.Kind() == reflect.Ptr {
+//		t = t.Elem()
+//	}
+//
+//	if t.Kind() == reflect.Struct {
+//		argsVal := make([]reflect.Value, t.NumField())
+//		args := make([]interface{}, t.NumField())
+//		for i := 0; i < t.NumField(); i++ {
+//			argType := t.Field(i).Type
+//			for argType.Kind() == reflect.Ptr {
+//				argType = argType.Elem()
+//			}
+//			argsVal[i] = reflect.New(argType)
+//			args[i] = argsVal[i].Interface()
+//		}
+//		if err := json.Unmarshal(*c.req.Params, &args); err != nil {
+//			return nil
+//		}
+//
+//		val := reflect.ValueOf(x)
+//		for i := 0; i < val.NumField(); i ++ {
+//			val.Field(i).Set(argsVal[i])
+//		}
+//
+//		fmt.Printf("x: %v\n", x)
+//
+//	} else {
+//		var args [1]interface{}
+//		args[0] = &x
+//
+//		return json.Unmarshal(*c.req.Params, &args)
+//	}
+
+	return fmt.Errorf("Not implemented")
 }
 
 var null = json.RawMessage([]byte("null"))
